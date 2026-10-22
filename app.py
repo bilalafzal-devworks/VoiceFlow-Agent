@@ -91,6 +91,14 @@ def run_pipeline(query, version):
         return
 
     st.session_state.result = result
+    if not result.evidence:  # nothing useful to send: skip the approval question
+        st.session_state.last_answer = ""
+        st.session_state.send_state = "idle"
+        st.session_state.notice = (
+            "No sources were found, so there is nothing worth sending. "
+            "Open 'Agent trace' to see why, or try rephrasing the request."
+        )
+        return
     st.session_state.last_answer = result.answer
     st.session_state.last_title = f"VoiceFlow: {query[:90]}"
     st.session_state.send_state = "asking"  # human-in-the-loop: ask before sending
