@@ -16,6 +16,7 @@ output format, fallback behaviour) so prompts can be versioned and compared.
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import time
@@ -62,6 +63,57 @@ def load_prompt(agent_key, version):
     return {"role": sections["role"], "goal": sections["goal"], "backstory": backstory}
 
 
+
+# ------------------------------------------------------ Groq compatibility
+def _patch_litellm_cache_breakpoint():
+    """Strip CrewAI's internal 'cache_breakpoint' key before messages reach Groq.
+
+    Recent CrewAI versions tag messages with 'cache_breakpoint' (used for prompt caching
+    on some providers). Groq rejects unknown message fields with a 400 error, so we remove
+    the key from every request sent through LiteLLM. Safe to call many times.
+    """
+    try:
+        import litellm
+    except ImportError:
+        return
+
+    def clean(messages):
+        if not isinstance(messages, list):
+            return messages
+        return [
+            {k: v for k, v in m.items() if k != "cache_breakpoint"} if isinstance(m, dict) else m
+            for m in messages
+        ]
+
+    def fix_args(args, kwargs):
+        if "messages" in kwargs:
+            kwargs["messages"] = clean(kwargs["messages"])
+        elif len(args) >= 2:
+            args = (args[0], clean(args[1])) + tuple(args[2:])
+        return args, kwargs
+
+    original = getattr(litellm, "completion", None)
+    if original is not None and not getattr(original, "_voiceflow_patched", False):
+
+        @functools.wraps(original)
+        def completion(*args, **kwargs):
+            args, kwargs = fix_args(args, kwargs)
+            return original(*args, **kwargs)
+
+        completion._voiceflow_patched = True
+        litellm.completion = completion
+
+    original_async = getattr(litellm, "acompletion", None)
+    if original_async is not None and not getattr(original_async, "_voiceflow_patched", False):
+
+        @functools.wraps(original_async)
+        async def acompletion(*args, **kwargs):
+            args, kwargs = fix_args(args, kwargs)
+            return await original_async(*args, **kwargs)
+
+        acompletion._voiceflow_patched = True
+        litellm.acompletion = acompletion
+
 # --------------------------------------------------------------- LLM calls
 def run_agent(agent_key, task_description, expected_output, version, temperature=0.2):
     """Run one CrewAI agent on one task and return its raw text output.
@@ -69,6 +121,8 @@ def run_agent(agent_key, task_description, expected_output, version, temperature
     Retries with a short back-off because the Groq free tier can rate-limit.
     """
     from crewai import LLM, Agent, Crew, Process, Task
+
+    _patch_litellm_cache_breakpoint()
 
     api_key = config.groq_api_key()
     if not api_key:
