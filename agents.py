@@ -294,28 +294,74 @@ def retrieve(query, version):
     return evidence, {"sufficient": sufficient, "notes": notes, "hits": len(hits)}
 
 
+# Search engines tried in order. DuckDuckGo alone is often blocked on cloud servers,
+# so we fall back to other engines supported by the `ddgs` package, then to Wikipedia.
+WEB_BACKENDS = ("auto", "brave", "duckduckgo", "mojeek", "yahoo", "startpage")
+last_web_error = ""  # human-readable reason when web search found nothing (shown in the trace)
+
+
+def _wikipedia_search(query, max_results):
+    """Last-resort fallback: the free Wikipedia search API (works from cloud servers)."""
+    import requests
+
+    resp = requests.get(
+        "https://en.wikipedia.org/w/api.php",
+        params={"action": "query", "list": "search", "srsearch": query, "srlimit": max_results, "format": "json"},
+        headers={"User-Agent": "VoiceFlowAgent/1.0 (course project)"},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    out = []
+    for item in resp.json().get("query", {}).get("search", []):
+        title = item.get("title", "")
+        snippet = re.sub(r"<[^>]+>", "", item.get("snippet", ""))  # remove <span> highlight tags
+        out.append({"title": f"{title} (Wikipedia)", "url": "https://en.wikipedia.org/wiki/" + title.replace(" ", "_"), "snippet": snippet})
+    return out
+
+
 def web_search(query, max_results=None):
-    """DuckDuckGo search (no API key). Returns [{title, url, snippet}] or [] on failure."""
+    """Web search with fallbacks. Returns [{title, url, snippet}] or [] (see last_web_error)."""
+    global last_web_error
     max_results = max_results or config.WEB_MAX_RESULTS
+    errors = []
+    raw = []
     try:
         try:
             from ddgs import DDGS
-        except ImportError:  # older package name
+
+            for backend in WEB_BACKENDS:
+                try:
+                    raw = DDGS().text(query, max_results=max_results, backend=backend) or []
+                except Exception as exc:  # blocked, rate-limited, no results...
+                    errors.append(f"{backend}: {str(exc)[:80]}")
+                    raw = []
+                if raw:
+                    break
+        except ImportError:  # older package name (no backend choice)
             from duckduckgo_search import DDGS
-        raw = DDGS().text(query, max_results=max_results) or []
-    except Exception:
-        return []
-    return [
+
+            raw = DDGS().text(query, max_results=max_results) or []
+    except Exception as exc:
+        errors.append(f"search library: {str(exc)[:80]}")
+
+    results = [
         {"title": r.get("title", ""), "url": r.get("href") or r.get("url", ""), "snippet": r.get("body", "")}
         for r in raw
     ]
+    if not results:  # fallback to Wikipedia
+        try:
+            results = _wikipedia_search(query, max_results)
+        except Exception as exc:
+            errors.append(f"wikipedia: {str(exc)[:80]}")
+    last_web_error = "" if results else "; ".join(errors) or "no results returned"
+    return results
 
 
 def research(query, version):
     """Researcher Agent: DuckDuckGo search (code) + fact extraction (agent). Returns (evidence, notes)."""
     results = web_search(query)
     if not results:
-        return [], "Web search returned no results (or was unavailable)."
+        return [], f"Web search returned no results. Details: {last_web_error}"
     listing = "\n\n".join(
         f"[W{i}] {r['title']}\nurl: {r['url']}\n{r['snippet']}" for i, r in enumerate(results, start=1)
     )
