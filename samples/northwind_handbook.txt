@@ -1,0 +1,16 @@
+Northwind Studio Employee Handbook (sample document for VoiceFlow tests)
+
+Remote work policy
+Employees may work remotely up to three days per week. Core collaboration hours are 10:00 to 15:00 Pakistan Standard Time. Remote workers must be reachable on Slack during core hours. Fully remote arrangements need written approval from a department head.
+
+Leave policy
+Full-time employees receive 20 days of paid annual leave per year. Unused leave, up to 5 days, can be carried over to the next year. Sick leave is 10 days per year and requires a medical note after 3 consecutive days.
+
+Equipment and expenses
+New employees receive a laptop within their first week. Expenses above 50 USD need manager approval before purchase. Receipts must be submitted within 14 days through the finance portal.
+
+Security rules
+All company laptops must use full-disk encryption. Passwords must be at least 12 characters and changed every 180 days. Report lost devices to the IT desk within 24 hours.
+
+Onboarding
+Week one covers tools setup and security training. Each new hire is assigned a buddy for the first 30 days. A 30-60-90 day plan is agreed with the manager in week two.
