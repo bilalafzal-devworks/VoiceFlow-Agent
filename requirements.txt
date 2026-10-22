@@ -1,6 +1,7 @@
 # Python 3.10 - 3.13 recommended (CrewAI requirement)
 streamlit>=1.40          # st.audio_input needs >= 1.39
-crewai>=0.100            # multi-agent framework (uses LiteLLM for Groq)
+crewai[litellm]          # multi-agent framework with LiteLLM support
+litellm                  # multi-agent framework (uses LiteLLM for Groq)
 groq>=0.11               # Whisper speech-to-text
 chromadb                 # persistent vector store (version resolved with crewai)
 pypdf>=4.0               # PDF text extraction
