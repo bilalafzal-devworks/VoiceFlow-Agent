@@ -1,27 +1,38 @@
-"""rag.py - the Retrieval-Augmented Generation knowledge base.
+"""rag.py - the Retrieval-Augmented Generation knowledge base (Groq only, no Hugging Face).
 
-Pipeline:  upload (PDF/TXT/MD) -> extract text -> chunk -> embed -> store in ChromaDB
-           query -> embed -> top-k similar chunks (with source + page metadata)
+Pipeline:  upload (PDF/TXT/MD) -> extract text -> chunk -> store (JSON file, with page metadata)
+           query -> BM25 keyword search (pure Python) -> Groq LLM reranks the candidates
+                 -> top-k chunks (with source + page metadata)
 
-Embeddings come from Hugging Face (sentence-transformers/all-MiniLM-L6-v2) through the
-free Inference API (needs HF_TOKEN). Set EMBEDDING_BACKEND=local to run the same model
-on your own machine instead (pip install sentence-transformers).
+Groq has no embeddings endpoint, so retrieval is done in two steps: fast BM25 keyword
+scoring picks candidate chunks, then a Groq model (GROQ_MODEL) reads them and orders them by
+how well they answer the question. No extra API key, no model download. If the Groq rerank
+call fails, the BM25 order is used, so search never breaks.
 """
 from __future__ import annotations
 
 import hashlib
 import io
-import time
+import json
+import math
+import re
+import threading
+from collections import Counter
 from pathlib import Path
-
-import requests
 
 import config
 
 CHARS_PER_TOKEN = 4  # rough rule of thumb for English text
 
-_collection = None
-_local_model = None
+active_backend = "BM25 + Groq rerank"  # shown in the UI
+
+_lock = threading.Lock()
+_store = None  # {chunk_id: {"text", "source", "page", "chunk"}}
+_STOPWORDS = frozenset(
+    "a an the and or but if of to in on at by for with from as is are was were be been being "
+    "it its this that these those i you he she we they what which who whom how why when where "
+    "do does did can could should would will about into than then so not no".split()
+)
 
 
 # ---------------------------------------------------------------- chunking
@@ -58,86 +69,98 @@ def chunk_text(text, chunk_tokens=None, overlap_tokens=None):
     return chunks
 
 
-# -------------------------------------------------------------- embeddings
-def _pool(data):
-    """Hugging Face returns n x d vectors (or n x tokens x d). Make it n x d."""
-    vectors = []
-    for item in data:
-        if item and isinstance(item[0], list):  # token-level -> mean pool
-            dim = len(item[0])
-            vectors.append([sum(tok[j] for tok in item) / len(item) for j in range(dim)])
-        else:
-            vectors.append(item)
-    return vectors
+# ------------------------------------------------------------ chunk store
+def _store_path():
+    return Path(config.CHROMA_DIR) / "chunks.json"
 
 
-def _embed_hf_api(texts):
-    token = config.hf_token()
-    if not token:
-        raise RuntimeError("HF_TOKEN is not set. Add it to .env (or Streamlit secrets).")
-    url = config.HF_EMBED_URL.format(model=config.EMBED_MODEL)
-    headers = {"Authorization": f"Bearer {token}"}
-    vectors = []
-    for i in range(0, len(texts), config.EMBED_BATCH):
-        batch = texts[i : i + config.EMBED_BATCH]
-        for attempt in range(4):
-            try:
-                resp = requests.post(
-                    url,
-                    headers=headers,
-                    json={"inputs": batch, "options": {"wait_for_model": True}},
-                    timeout=60,
-                )
-            except requests.RequestException as exc:
-                raise RuntimeError(f"Could not reach Hugging Face: {exc}") from exc
-            if resp.status_code == 200:
-                break
-            if resp.status_code in (429, 503):  # busy / model loading: wait and retry
-                time.sleep(2 * (attempt + 1))
-                continue
-            raise RuntimeError(f"Hugging Face embedding failed ({resp.status_code}): {resp.text[:200]}")
-        else:
-            raise RuntimeError("Hugging Face embedding is still busy after several retries. Try again.")
-        vectors.extend(_pool(resp.json()))
-    return vectors
+def _load():
+    global _store
+    if _store is None:
+        path = _store_path()
+        try:
+            _store = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except (OSError, ValueError):
+            _store = {}
+    return _store
 
 
-def _embed_local(texts):
-    global _local_model
-    if _local_model is None:
-        from sentence_transformers import SentenceTransformer
-
-        _local_model = SentenceTransformer(config.EMBED_MODEL)
-    return _local_model.encode(texts, normalize_embeddings=True).tolist()
-
-
-def embed_texts(texts):
-    """Return one embedding vector (list of floats) per input text."""
-    if not texts:
-        return []
-    if config.EMBEDDING_BACKEND == "local":
-        return _embed_local(texts)
-    return _embed_hf_api(texts)
-
-
-# ------------------------------------------------------------ vector store
-def _get_collection():
-    global _collection
-    if _collection is None:
-        import chromadb
-
-        config.CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-        client = chromadb.PersistentClient(path=str(config.CHROMA_DIR))
-        _collection = client.get_or_create_collection(
-            name=config.COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
-        )
-    return _collection
+def _save():
+    path = _store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(_store), encoding="utf-8")
+    tmp.replace(path)
 
 
 def reset_handles():
-    """Forget the cached collection (used by tests after changing CHROMA_DIR)."""
-    global _collection
-    _collection = None
+    """Forget the cached store (used by tests after changing CHROMA_DIR)."""
+    global _store
+    _store = None
+
+
+# ---------------------------------------------------------------- BM25
+def _tokens(text):
+    return [t for t in re.findall(r"[a-z0-9]+", text.lower()) if t not in _STOPWORDS]
+
+
+def _bm25(query, chunks, k1=1.5, b=0.75):
+    """Score every chunk against the query. Returns [(score, chunk_id)] best first."""
+    q_terms = set(_tokens(query))
+    if not q_terms or not chunks:
+        return []
+    docs = {cid: _tokens(c["text"]) for cid, c in chunks.items()}
+    n = len(docs)
+    avg_len = (sum(len(d) for d in docs.values()) / n) or 1.0
+    df = Counter(t for d in docs.values() for t in set(d) if t in q_terms)
+    scored = []
+    for cid, toks in docs.items():
+        tf = Counter(toks)
+        score = 0.0
+        for t in q_terms:
+            if t not in tf:
+                continue
+            idf = math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5))
+            score += idf * tf[t] * (k1 + 1) / (tf[t] + k1 * (1 - b + b * len(toks) / avg_len))
+        if score > 0:
+            scored.append((score, cid))
+    scored.sort(reverse=True)
+    return scored
+
+
+# ------------------------------------------------------------ Groq rerank
+def _rerank_with_groq(query, candidates, k):
+    """Ask Groq to pick the best chunk numbers. Returns an ordered list of indexes or None."""
+    api_key = config.groq_api_key()
+    if not api_key or len(candidates) <= 1:
+        return None
+    try:
+        from groq import Groq
+
+        listing = "\n\n".join(f"[{i}] {c['text'][:700]}" for i, c in enumerate(candidates))
+        resp = Groq(api_key=api_key).chat.completions.create(
+            model=config.GROQ_MODEL,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You rank passages for a retrieval system. Reply with JSON only: "
+                    '{"ranked": [passage numbers, most relevant first]}. Include only passages '
+                    "that help answer the question.",
+                },
+                {"role": "user", "content": f"Question: {query}\n\nPassages:\n{listing}\n\nReturn the top {k}."},
+            ],
+        )
+        text = resp.choices[0].message.content or ""
+        match = re.search(r"\{.*\}", text, re.S)
+        ranked = json.loads(match.group(0)).get("ranked", []) if match else []
+        order = []
+        for i in ranked:
+            if isinstance(i, int) and 0 <= i < len(candidates) and i not in order:
+                order.append(i)
+        return order or None
+    except Exception:
+        return None  # rate limit, network, bad JSON: fall back to BM25 order
 
 
 def extract_pages(filename, data):
@@ -168,65 +191,63 @@ def ingest_file(filename, data):
             metas.append({"source": filename, "page": page_no, "chunk": idx})
     if not docs:
         raise ValueError(f"No readable text found in '{filename}' (scanned PDF? try OCR first).")
-    embeddings = embed_texts(docs)
-    _get_collection().upsert(ids=ids, documents=docs, metadatas=metas, embeddings=embeddings)
+    with _lock:
+        store = _load()
+        for cid, doc, meta in zip(ids, docs, metas):
+            store[cid] = {"text": doc, **meta}
+        _save()
     return len(docs)
 
 
 def search(query, k=None):
-    """Return the top-k chunks for a query: [{id, text, source, page, distance}]."""
-    col = _get_collection()
-    total = col.count()
-    if total == 0:
+    """Return the top-k chunks for a query: [{id, text, source, page, distance}].
+
+    `distance` is kept for the UI/prompts: lower = better (1 / (1 + BM25 score)).
+    """
+    k = k or config.TOP_K
+    store = _load()
+    scored = _bm25(query, store)[: max(k * 3, 12)]
+    if not scored:
         return []
-    k = min(k or config.TOP_K, total)
-    query_vec = embed_texts([query])[0]
-    res = col.query(
-        query_embeddings=[query_vec],
-        n_results=k,
-        include=["documents", "metadatas", "distances"],
-    )
-    hits = []
-    for doc_id, doc, meta, dist in zip(
-        res["ids"][0], res["documents"][0], res["metadatas"][0], res["distances"][0]
-    ):
-        hits.append(
-            {
-                "id": doc_id,
-                "text": doc,
-                "source": meta.get("source", "unknown"),
-                "page": meta.get("page", 1),
-                "distance": round(float(dist), 4),
-            }
-        )
-    return hits
+    candidates = [dict(store[cid], id=cid, score=score) for score, cid in scored]
+    order = _rerank_with_groq(query, candidates, k)
+    if order:
+        candidates = [candidates[i] for i in order]
+    return [
+        {
+            "id": c["id"],
+            "text": c["text"],
+            "source": c.get("source", "unknown"),
+            "page": c.get("page", 1),
+            "distance": round(1 / (1 + c["score"]), 4),
+        }
+        for c in candidates[:k]
+    ]
 
 
 def count():
-    return _get_collection().count()
+    return len(_load())
 
 
 def list_sources():
     """Return {filename: number_of_chunks}."""
-    metas = _get_collection().get(include=["metadatas"])["metadatas"] or []
     sources = {}
-    for meta in metas:
-        name = meta.get("source", "unknown")
+    for c in _load().values():
+        name = c.get("source", "unknown")
         sources[name] = sources.get(name, 0) + 1
     return dict(sorted(sources.items()))
 
 
 def delete_source(filename):
-    _get_collection().delete(where={"source": filename})
+    with _lock:
+        store = _load()
+        for cid in [cid for cid, c in store.items() if c.get("source") == filename]:
+            del store[cid]
+        _save()
 
 
 def clear():
     """Delete everything in the knowledge base."""
-    import chromadb
-
-    client = chromadb.PersistentClient(path=str(config.CHROMA_DIR))
-    try:
-        client.delete_collection(config.COLLECTION_NAME)
-    except Exception:
-        pass
-    reset_handles()
+    with _lock:
+        _load().clear()
+        _save()
