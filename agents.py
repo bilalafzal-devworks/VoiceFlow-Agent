@@ -510,7 +510,7 @@ def review_document(query, evidence, draft, version):
         expected_output='A JSON object with keys "approved", "groundedness_score", "citations_ok", "format_ok", "issues", "revision_instructions".',
         version=version,
         temperature=0.0,
-        max_tokens=800,
+        max_tokens=4000,  # gpt-oss is a reasoning model: thinking tokens count toward this limit
     )
     obj = extract_json(raw)
     ok = bool(obj) and "approved" in obj
@@ -569,7 +569,16 @@ def answer_question(query, has_previous_answer=False, prompt_version=None, progr
             _notify(progress, "Writer Agent: writing the document..." if revision == 0 else "Writer Agent: revising the document...")
             draft = write_document(query, evidence, version, feedback=feedback, previous_draft=draft if feedback else None)
             _notify(progress, "Reviewer Agent: checking the document...")
-            result.review, result.review_json_ok = review_document(query, evidence, draft, version)
+            try:
+                result.review, result.review_json_ok = review_document(query, evidence, draft, version)
+            except AgentError as exc:  # keep the document; just mark it as not reviewed
+                result.review = {
+                    "approved": False,
+                    "groundedness_score": 0,
+                    "issues": [f"Reviewer unavailable, document NOT checked: {str(exc)[:150]}"],
+                    "revision_instructions": "",
+                }
+                result.review_json_ok = False
             result.revisions = revision
             result.trace.append({"agent": "Reviewer", "output": result.review})
             too_short = len(draft.split()) < MIN_DOC_WORDS
