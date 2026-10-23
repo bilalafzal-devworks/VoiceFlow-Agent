@@ -27,6 +27,11 @@ import n8n_client
 import rag
 import voice
 
+import inspect
+
+# True only if agents.py is the new version that supports document mode.
+AGENTS_UP_TO_DATE = "doc_mode" in inspect.signature(agents.answer_question).parameters
+
 st.set_page_config(page_title="VoiceFlow Agent", page_icon="🎙️", layout="wide")
 
 LANGUAGES = {"Auto-detect": None, "English": "en", "Urdu": "ur", "Hindi": "hi", "Arabic": "ar"}
@@ -45,6 +50,8 @@ def init_state():
         "error_msg": "",
         "seen_audio": set(),     # hashes of recordings we already processed
         "notice": "",
+        "rec_key": 0,            # changing a widget key gives a brand-new, empty recorder
+        "confirm_key": 0,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -60,6 +67,21 @@ def is_new_audio(audio_file, tag):
 
 
 # ------------------------------------------------------------- actions
+def clear_all():
+    """Reset everything for a fresh request: recording, transcript, answer and approval state."""
+    st.session_state.transcript_box = ""
+    st.session_state.result = None
+    st.session_state.last_answer = ""
+    st.session_state.last_title = ""
+    st.session_state.send_state = "idle"
+    st.session_state.doc_url = ""
+    st.session_state.error_msg = ""
+    st.session_state.notice = ""
+    st.session_state.seen_audio = set()
+    st.session_state.rec_key += 1      # new key -> the recorder comes back empty
+    st.session_state.confirm_key += 1  # same for the yes/no voice recorder
+
+
 def run_pipeline(query, version, doc_mode=None):
     """Run the agents and update session state."""
     st.session_state.send_state = "idle"
@@ -144,7 +166,7 @@ def sidebar():
             try:
                 with st.spinner(f"Embedding {f.name}..."):
                     n = rag.ingest_file(f.name, f.getvalue())
-                st.sidebar.success(f"{f.name}: {n} chunks stored")
+                st.sidebar.success(f"{f.name}: {n} chunks stored (embeddings: {rag.active_backend})")
             except Exception as exc:
                 st.sidebar.error(f"{f.name}: {exc}")
 
@@ -164,6 +186,7 @@ def sidebar():
         st.sidebar.caption("Empty. Upload a document to get started.")
 
     st.sidebar.divider()
+    st.sidebar.caption("Build: agents.py " + ("✅ document mode" if AGENTS_UP_TO_DATE else "❌ outdated"))
     st.sidebar.caption(
         "Keys found: "
         f"Groq {'✅' if config.groq_api_key() else '❌'} · "
@@ -221,7 +244,7 @@ def approval_block(recipient):
             st.session_state.send_state = "declined"
             st.rerun()
 
-        reply = st.audio_input("…or answer by voice", key="confirm_audio")
+        reply = st.audio_input("…or answer by voice", key=f"confirm_audio_{st.session_state.confirm_key}")
         if reply and is_new_audio(reply, "confirm"):
             try:
                 said = voice.transcribe(reply.getvalue())
@@ -253,13 +276,20 @@ def approval_block(recipient):
 
 def main():
     init_state()
+    if not AGENTS_UP_TO_DATE:
+        st.error(
+            "Your deployed agents.py is OUTDATED (it has no document mode). "
+            "Replace agents.py in your GitHub repository with the latest version, commit it, "
+            "then use Manage app > Reboot app."
+        )
+        st.stop()
     version, language, recipient, doc_mode = sidebar()
 
     st.title("🎙️ VoiceFlow Agent")
     st.caption("Speak a request → multi-agent RAG answer → optional delivery to Google Docs + Gmail via n8n")
 
     # 1) voice -> text (done BEFORE the text box is drawn so we can fill it)
-    audio = st.audio_input("Record your request")
+    audio = st.audio_input("Record your request", key=f"request_audio_{st.session_state.rec_key}")
     if audio and is_new_audio(audio, "request"):
         try:
             with st.spinner("Transcribing with Whisper..."):
@@ -269,7 +299,10 @@ def main():
 
     # 2) editable transcript
     st.text_area("Transcript (edit if needed, or just type)", key="transcript_box", height=90)
-    if st.button("Ask the agents", type="primary"):
+    col_ask, col_clear, _ = st.columns([1, 1.3, 6])
+    ask_clicked = col_ask.button("Ask the agents", type="primary")
+    col_clear.button("🧹 Clear / new request", on_click=clear_all, help="Removes the recording, transcript and previous answer")
+    if ask_clicked:
         query = st.session_state.transcript_box.strip()
         if query:
             run_pipeline(query, version, doc_mode)
