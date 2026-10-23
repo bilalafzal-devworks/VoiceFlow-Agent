@@ -115,7 +115,18 @@ def _patch_litellm_cache_breakpoint():
         litellm.acompletion = acompletion
 
 # --------------------------------------------------------------- LLM calls
-def run_agent(agent_key, task_description, expected_output, version, temperature=0.2):
+def _retry_delay(exc, attempt):
+    """Seconds to wait before retrying. Uses Groq's own hint ("try again in 7.5s") when present."""
+    m = re.search(r"try again in\s*(?:(\d+)m)?\s*([\d.]+)(ms|s)", str(exc), re.I)
+    if m:
+        minutes = int(m.group(1) or 0)
+        value = float(m.group(2))
+        seconds = minutes * 60 + (value / 1000 if m.group(3).lower() == "ms" else value)
+        return min(seconds + 1, 45)
+    return 2 * 2**attempt  # 4s, 8s, 16s...
+
+
+def run_agent(agent_key, task_description, expected_output, version, temperature=0.2, max_tokens=None):
     """Run one CrewAI agent on one task and return its raw text output.
 
     Retries with a short back-off because the Groq free tier can rate-limit.
@@ -132,7 +143,10 @@ def run_agent(agent_key, task_description, expected_output, version, temperature
     last_error = None
     for attempt in range(1, config.LLM_RETRIES + 1):
         try:
-            llm = LLM(model=f"groq/{config.GROQ_MODEL}", api_key=api_key, temperature=temperature)
+            llm_kwargs = {"model": f"groq/{config.GROQ_MODEL}", "api_key": api_key, "temperature": temperature}
+            if max_tokens:
+                llm_kwargs["max_tokens"] = max_tokens
+            llm = LLM(**llm_kwargs)
             agent = Agent(
                 role=prompt["role"],
                 goal=prompt["goal"],
@@ -147,8 +161,10 @@ def run_agent(agent_key, task_description, expected_output, version, temperature
             return str(getattr(result, "raw", result)).strip()
         except Exception as exc:  # rate limit, network, provider error...
             last_error = exc
+            if "AuthenticationError" in str(exc) or "invalid_api_key" in str(exc):
+                break  # a wrong key will not fix itself: fail fast
             if attempt < config.LLM_RETRIES:
-                time.sleep(2**attempt)
+                time.sleep(_retry_delay(exc, attempt))
     raise AgentError(f"The language model call failed after {config.LLM_RETRIES} tries: {last_error}")
 
 
@@ -212,6 +228,8 @@ class PipelineResult:
     used_web: bool = False
     citations_ok: bool = False
     trace: list = field(default_factory=list)
+    doc_mode: bool = False  # True when a full document was requested
+    no_sources: bool = False  # True when no evidence was found
 
 
 def format_evidence(evidence):
@@ -357,9 +375,31 @@ def web_search(query, max_results=None):
     return results
 
 
-def research(query, version):
-    """Researcher Agent: DuckDuckGo search (code) + fact extraction (agent). Returns (evidence, notes)."""
-    results = web_search(query)
+def web_search_many(queries, max_total=10):
+    """Run several searches and merge the results (no duplicate URLs). Stops early if the first finds nothing."""
+    merged, seen = [], set()
+    for i, q in enumerate(queries):
+        found = web_search(q)
+        if i == 0 and not found:
+            return []  # search is blocked or empty: do not waste time on variants
+        for r in found:
+            key = r["url"] or r["title"]
+            if key not in seen:
+                seen.add(key)
+                merged.append(r)
+    return merged[:max_total]
+
+
+def research(query, version, doc_mode=False):
+    """Researcher Agent: web search (code) + fact extraction (agent). Returns (evidence, notes).
+
+    In document mode we search a few query variants and keep more findings.
+    """
+    if doc_mode:
+        results = web_search_many([query, f"{query} overview", f"{query} latest developments"])
+    else:
+        results = web_search(query)
+    max_findings = 8 if doc_mode else 5
     if not results:
         return [], f"Web search returned no results. Details: {last_web_error}"
     listing = "\n\n".join(
@@ -378,14 +418,14 @@ def research(query, version):
     obj = extract_json(raw)
     evidence = []
     if obj and isinstance(obj.get("findings"), list):
-        for f in obj["findings"][:5]:
+        for f in obj["findings"][:max_findings]:
             if isinstance(f, dict) and f.get("fact"):
                 url = str(f.get("url", ""))
                 title = str(f.get("title", "")) or url
                 evidence.append(Evidence(id="", kind="web", label=f"{title} - {url}", text=str(f["fact"]), url=url))
         return evidence, str(obj.get("notes", ""))
     # Invalid JSON: fall back to the raw search snippets so the user still gets something grounded.
-    for r in results[:3]:
+    for r in results[: (6 if doc_mode else 3)]:
         if r["snippet"]:
             evidence.append(Evidence(id="", kind="web", label=f"{r['title']} - {r['url']}", text=r["snippet"], url=r["url"]))
     return evidence, "Researcher reply was not valid JSON; used raw search snippets."
@@ -426,11 +466,66 @@ def review(query, evidence, draft, version):
     return obj, ok
 
 
+# ------------------------------------------------------- document mode
+DOC_REQUEST_RE = re.compile(
+    r"\b(report|documentation|document|guide|tutorial|whitepaper|white paper|handbook|overview of|write[- ]?up|explain in detail)\b",
+    re.I,
+)
+DOC_VERB_RE = re.compile(r"\b(generate|write|create|make|prepare|draft|produce|give me|build)\b", re.I)
+NO_SOURCES_NOTICE = "No sources were retrieved"
+MIN_DOC_WORDS = 450  # shorter documents are sent back to the Writer once for expansion
+
+
+def wants_document(query):
+    """True when the request sounds like 'generate a report / documentation / guide ...'."""
+    return bool(DOC_REQUEST_RE.search(query) and DOC_VERB_RE.search(query))
+
+
+def write_document(query, evidence, version, feedback=None, previous_draft=None):
+    """Writer (document mode): a structured markdown document, cited where evidence exists."""
+    block = format_evidence(evidence) if evidence else "(none)"
+    task = f"Topic requested by the user: {query}\n\nEvidence:\n{block}\n\n"
+    if feedback and previous_draft:
+        task += f"Your previous draft:\n{previous_draft}\n\nReviewer feedback to fix:\n{feedback}\n\n"
+    task += "Write the full document in the output format described in your instructions."
+    return run_agent(
+        "writer_doc",
+        task_description=task,
+        expected_output="A markdown document with Title, Overview, sections, Limitations and Sources.",
+        version=version,
+        temperature=0.3,
+        max_tokens=6000,
+    )
+
+
+def review_document(query, evidence, draft, version):
+    """Reviewer (document mode) -> (review_dict, json_ok)."""
+    block = format_evidence(evidence) if evidence else "(none)"
+    raw = run_agent(
+        "reviewer_doc",
+        task_description=(
+            f"Topic: {query}\n\nEvidence:\n{block}\n\nDraft document to audit:\n{draft}\n\n"
+            "Audit the draft and reply with the JSON object described in your instructions."
+        ),
+        expected_output='A JSON object with keys "approved", "groundedness_score", "citations_ok", "format_ok", "issues", "revision_instructions".',
+        version=version,
+        temperature=0.0,
+        max_tokens=800,
+    )
+    obj = extract_json(raw)
+    ok = bool(obj) and "approved" in obj
+    if not ok:
+        obj = {"approved": False, "groundedness_score": 0, "issues": ["Reviewer reply was not valid JSON."], "revision_instructions": ""}
+    return obj, ok
+
+
 # ---------------------------------------------------------------- pipeline
-def answer_question(query, has_previous_answer=False, prompt_version=None, progress: Optional[Callable] = None):
+def answer_question(query, has_previous_answer=False, prompt_version=None, progress: Optional[Callable] = None, doc_mode=None):
     """Run the whole multi-agent pipeline for one transcribed request."""
     version = prompt_version or config.DEFAULT_PROMPT_VERSION
-    result = PipelineResult(query=query)
+    if doc_mode is None:  # automatic: "generate a report on ..." -> document mode
+        doc_mode = wants_document(query)
+    result = PipelineResult(query=query, doc_mode=bool(doc_mode))
 
     # 1) Router
     _notify(progress, "Router Agent: understanding your request...")
@@ -455,7 +550,7 @@ def answer_question(query, has_previous_answer=False, prompt_version=None, progr
     # 3) Researcher (only when the knowledge base is not enough)
     if result.intent == "web_lookup" or not kb_sufficient:
         _notify(progress, "Researcher Agent: searching the web...")
-        web_evidence, notes = research(search_query, version)
+        web_evidence, notes = research(search_query, version, doc_mode=bool(doc_mode))
         evidence.extend(web_evidence)
         result.used_web = True
         result.trace.append({"agent": "Researcher", "output": {"findings": len(web_evidence), "notes": notes}})
@@ -463,6 +558,33 @@ def answer_question(query, has_previous_answer=False, prompt_version=None, progr
     for i, ev in enumerate(evidence, start=1):  # number the evidence S1, S2, ...
         ev.id = f"S{i}"
     result.evidence = evidence
+
+    result.no_sources = not evidence
+
+    # Document mode: write (and review) a full document, even without sources. With no sources the
+    # Writer must label the text as general knowledge (see prompts/<version>/writer_doc.md).
+    if doc_mode:
+        draft, feedback = None, None
+        for revision in range(min(config.MAX_REVISIONS, 1) + 1):  # at most 1 revision: saves free-tier tokens
+            _notify(progress, "Writer Agent: writing the document..." if revision == 0 else "Writer Agent: revising the document...")
+            draft = write_document(query, evidence, version, feedback=feedback, previous_draft=draft if feedback else None)
+            _notify(progress, "Reviewer Agent: checking the document...")
+            result.review, result.review_json_ok = review_document(query, evidence, draft, version)
+            result.revisions = revision
+            result.trace.append({"agent": "Reviewer", "output": result.review})
+            too_short = len(draft.split()) < MIN_DOC_WORDS
+            if (result.review.get("approved") or not result.review_json_ok) and not (too_short and revision == 0):
+                break
+            feedback = str(result.review.get("revision_instructions") or "; ".join(map(str, result.review.get("issues", []))))
+            if too_short:
+                feedback = (
+                    f"The document is too short ({len(draft.split())} words). Expand it to at least {MIN_DOC_WORDS + 300} words "
+                    "with more detail in each section, using the evidence. Do not invent facts. " + feedback
+                )
+        result.answer = draft or ""
+        result.approved = bool(result.review.get("approved"))
+        result.citations_ok = (NO_SOURCES_NOTICE in result.answer) if not evidence else bool(CITATION_RE.search(result.answer))
+        return result
 
     # Guardrail: no evidence at all -> say "I don't know" without calling the Writer.
     if not evidence:
