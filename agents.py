@@ -245,14 +245,21 @@ def _notify(progress, message):
 
 
 # ------------------------------------------------------------------ agents
-def route(query, has_previous_answer, version):
-    """Router Agent -> (route_dict, json_ok)."""
+def route(query, has_previous_answer, version, kb_sources=None):
+    """Router Agent -> (route_dict, json_ok). kb_sources = names of documents in the knowledge base."""
+    kb_line = (
+        f"Documents in the user's knowledge base: {', '.join(kb_sources)}. If the request could be about the content of "
+        "these documents (names, products, policies, topics), choose knowledge_question, not web_lookup.\n"
+        if kb_sources
+        else "The knowledge base is empty.\n"
+    )
     raw = run_agent(
         "router",
         task_description=(
             f'Transcribed user request:\n"""{query}"""\n\n'
             f"A previous answer available to send: {'yes' if has_previous_answer else 'no'}.\n"
-            "Classify the request and reply with the JSON object described in your instructions."
+            + kb_line
+            + "Classify the request and reply with the JSON object described in your instructions."
         ),
         expected_output='A JSON object with keys "intent", "confidence", "search_query", "reason".',
         version=version,
@@ -273,12 +280,17 @@ def route(query, has_previous_answer, version):
     return obj, ok
 
 
-def retrieve(query, version):
+def retrieve(query, version, alt_query=None):
     """Retriever Agent: vector search (code) + relevance judgement (agent).
 
-    Returns (evidence_list, info_dict). info has 'sufficient' and 'notes'.
+    `query` is what the user actually said; `alt_query` is the Router's cleaned-up version.
+    Searching with both avoids losing important words. Returns (evidence_list, info_dict).
     """
     hits = rag.search(query)
+    if alt_query and alt_query.strip().lower() != query.strip().lower():
+        seen = {h["id"] for h in hits}
+        hits += [h for h in rag.search(alt_query) if h["id"] not in seen]
+        hits = sorted(hits, key=lambda h: h["distance"])[: config.TOP_K + 2]  # smaller cosine distance = closer
     if not hits:
         return [], {"sufficient": False, "notes": "Knowledge base is empty or returned no passages.", "hits": 0}
 
@@ -309,7 +321,8 @@ def retrieve(query, version):
         Evidence(id="", kind="kb", label=f"{labelled[k]['source']}, p.{labelled[k]['page']}", text=labelled[k]["text"])
         for k in relevant
     ]
-    return evidence, {"sufficient": sufficient, "notes": notes, "hits": len(hits)}
+    top_hits = [f"{h['source']} p.{h['page']} (distance {h['distance']})" for h in hits]
+    return evidence, {"sufficient": sufficient, "notes": notes, "hits": len(hits), "top_hits": top_hits}
 
 
 # Search engines tried in order. DuckDuckGo alone is often blocked on cloud servers,
@@ -473,6 +486,7 @@ DOC_REQUEST_RE = re.compile(
 )
 DOC_VERB_RE = re.compile(r"\b(generate|write|create|make|prepare|draft|produce|give me|build)\b", re.I)
 NO_SOURCES_NOTICE = "No sources were retrieved"
+EXPLICIT_WEB_RE = re.compile(r"\b(web|internet|online|google|news|latest|current|today|search)\b", re.I)
 MIN_DOC_WORDS = 450  # shorter documents are sent back to the Writer once for expansion
 
 
@@ -527,9 +541,14 @@ def answer_question(query, has_previous_answer=False, prompt_version=None, progr
         doc_mode = wants_document(query)
     result = PipelineResult(query=query, doc_mode=bool(doc_mode))
 
+    try:
+        kb_sources = list(rag.list_sources())
+    except Exception:  # knowledge base unavailable: continue without it
+        kb_sources = []
+
     # 1) Router
     _notify(progress, "Router Agent: understanding your request...")
-    result.route, result.route_json_ok = route(query, has_previous_answer, version)
+    result.route, result.route_json_ok = route(query, has_previous_answer, version, kb_sources=kb_sources)
     result.intent = result.route["intent"]
     result.trace.append({"agent": "Router", "output": result.route})
     if result.intent == "send_save":
@@ -540,15 +559,20 @@ def answer_question(query, has_previous_answer=False, prompt_version=None, progr
 
     # 2) Retriever (skipped when the router says the user wants the web)
     kb_sufficient = False
-    if result.intent == "knowledge_question":
+    # The knowledge base is ALWAYS consulted when it holds documents, even if the Router guessed
+    # "web_lookup" (the Router cannot see inside your documents, so it can guess wrong).
+    if kb_sources:
         _notify(progress, "Retriever Agent: searching the knowledge base...")
-        kb_evidence, info = retrieve(search_query, version)
+        kb_evidence, info = retrieve(query, version, alt_query=search_query)
         evidence.extend(kb_evidence)
         kb_sufficient = info["sufficient"]
         result.trace.append({"agent": "Retriever", "output": info})
+    elif result.intent == "knowledge_question":
+        result.trace.append({"agent": "Retriever", "output": {"sufficient": False, "notes": "Knowledge base is empty."}})
 
-    # 3) Researcher (only when the knowledge base is not enough)
-    if result.intent == "web_lookup" or not kb_sufficient:
+    # 3) Researcher: when the knowledge base is not enough, or the user explicitly asked for the web
+    wants_web = result.intent == "web_lookup" and bool(EXPLICIT_WEB_RE.search(query))
+    if wants_web or not kb_sufficient:
         _notify(progress, "Researcher Agent: searching the web...")
         web_evidence, notes = research(search_query, version, doc_mode=bool(doc_mode))
         evidence.extend(web_evidence)
