@@ -31,6 +31,8 @@ import inspect
 
 # True only if agents.py is the new version that supports document mode.
 AGENTS_UP_TO_DATE = "doc_mode" in inspect.signature(agents.answer_question).parameters
+# True only if rag.py is the new version with the local (ONNX) embedding fallback.
+RAG_UP_TO_DATE = hasattr(rag, "_embed_onnx")
 
 st.set_page_config(page_title="VoiceFlow Agent", page_icon="🎙️", layout="wide")
 
@@ -185,8 +187,24 @@ def sidebar():
     else:
         st.sidebar.caption("Empty. Upload a document to get started.")
 
+    with st.sidebar.expander("🔍 Test retrieval (no AI call)"):
+        st.caption("Shows the raw passages the knowledge base returns for a query.")
+        test_q = st.text_input("Search query", key="retrieval_test_query")
+        if st.button("Search", key="retrieval_test_btn") and test_q.strip():
+            try:
+                hits = rag.search(test_q.strip())
+            except Exception as exc:
+                hits = []
+                st.error(f"Search failed: {exc}")
+            if not hits and sources:
+                st.warning("No passages returned.")
+            for h in hits:
+                st.markdown(f"**{h['source']}, p.{h['page']}** · distance {h['distance']}")
+                st.caption(h["text"][:300])
+
     st.sidebar.divider()
     st.sidebar.caption("Build: agents.py " + ("✅ document mode" if AGENTS_UP_TO_DATE else "❌ outdated"))
+    st.sidebar.caption("Build: rag.py " + ("✅ local embedding fallback" if RAG_UP_TO_DATE else "❌ outdated"))
     st.sidebar.caption(
         "Keys found: "
         f"Groq {'✅' if config.groq_api_key() else '❌'} · "
